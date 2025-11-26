@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+playwright
+PyPDF2
+pydantic
+python-multipart
