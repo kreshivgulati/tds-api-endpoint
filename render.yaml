@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: tds-api-endpoint
+    env: docker
+    repo: https://github.com/kreshivgulati/tds-api-endpoint
+    branch: main
+    plan: free
+    autoDeploy: true
+    buildCommand: ""
+    startCommand: ""
