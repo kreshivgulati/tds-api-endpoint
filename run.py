@@ -90,7 +90,7 @@ def extract_text_fallback(reader):
 # API QUIZ
 # --------------------------------------------------------------------
 async def handle_api_quiz(email, secret, url, html):
-    api_match = re.search(r'GET\s+(https?://[^\s"'<>"]+)', html)
+ api_match = re.search(r'GET\s+(https?://[^\s"\'<>]+)', html)
     if not api_match:
         return {"error": "API URL not found"}
 
@@ -509,3 +509,4 @@ async def handle_pdf_quiz(email, secret, url, html, pdf_match):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("run:app", host="0.0.0.0", port=8000)
+
