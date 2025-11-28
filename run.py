@@ -1,3 +1,5 @@
+# ---------------- FIXED CODE -----------------
+
 import sys
 import asyncio
 import csv
@@ -18,7 +20,6 @@ if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 app = FastAPI()
-
 STUDENT_SECRET = "kreshiv"
 
 
@@ -32,16 +33,11 @@ class QuizRequest(BaseModel):
 async def quiz_entry(payload: QuizRequest):
     if not payload.email or not payload.secret or not payload.url:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
-
     if payload.secret != STUDENT_SECRET:
         return JSONResponse(status_code=403, content={"error": "Invalid secret"})
 
     start_time = time.time()
-
-    result = await solve_quiz_recursive(
-        payload.email, payload.secret, payload.url, start_time, 180
-    )
-
+    result = await solve_quiz_recursive(payload.email, payload.secret, payload.url, start_time, 180)
     return JSONResponse(content={"status": "secret verified", "result": result})
 
 
@@ -53,97 +49,118 @@ async def solve_quiz_recursive(email, secret, url, start_time, deadline):
         return {"error": "Time exceeded 3 minutes"}
 
     result = await solve_single_quiz(email, secret, url)
-
     if "error" in result:
         return result
 
     if result.get("next_url"):
-        return await solve_quiz_recursive(
-            email, secret, result["next_url"], start_time, deadline
-        )
+        return await solve_quiz_recursive(email, secret, result["next_url"], start_time, deadline)
 
     return result
 
+
 # --------------------------------------------------------------------
-# API QUIZ (GET request with headers)
+# PDF FALLBACK EXTRACTION
+# --------------------------------------------------------------------
+def extract_text_fallback(reader):
+    full_text = ""
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+            full_text += t + "\n"
+            continue
+        except:
+            pass
+        try:
+            contents = page.get_contents()
+            if contents:
+                raw_bytes = contents.get_data()
+                full_text += raw_bytes.decode('latin-1', errors='ignore') + "\n"
+        except:
+            pass
+        try:
+            raw_page = page.extract_text() or ""
+            raw_numbers = re.findall(rb"\d+", raw_page)
+            full_text += " ".join(n.decode() for n in raw_numbers) + "\n"
+        except:
+            pass
+    return full_text
+
+
+# --------------------------------------------------------------------
+# API QUIZ
 # --------------------------------------------------------------------
 async def handle_api_quiz(email, secret, url, html):
-    import json
-
-    # Detect API GET URL inside the instructions
     api_match = re.search(r'GET\s+(https?://[^\s"\'<>]+)', html)
     if not api_match:
         return {"error": "API URL not found"}
 
     api_url = api_match.group(1)
-
-    # Detect HTTP headers in the instructions:
-    # Example:
-    #   Authorization: Bearer 12345
-    #   X-API-Key: abcdef
     header_matches = re.findall(r'([A-Za-z0-9\-]+)\s*:\s*([^\n<]+)', html)
 
-    headers = {}
-    for key, value in header_matches:
-        headers[key.strip()] = value.strip()
+    headers = {k.strip(): v.strip() for k, v in header_matches}
 
-    # Call the API
     async with httpx.AsyncClient() as client:
         api_resp = await client.get(api_url, headers=headers)
 
-    # Try parsing JSON, fallback to text
     try:
         data = api_resp.json()
     except:
         data = api_resp.text
 
-    # -----------------------------------------------------
-    # Now compute the answer depending on the data shape
-    # -----------------------------------------------------
-
-    # Case A: JSON list of objects with "value" keys
     if isinstance(data, list) and all(isinstance(x, dict) for x in data):
         if "value" in data[0]:
-            answer = sum(item["value"] for item in data if isinstance(item.get("value"), (int, float)))
+            answer = sum(item["value"] for item in data)
         else:
-            answer = len(data)  # fallback logic
-
-    # Case B: JSON object -> count keys or sum numbers inside
+            answer = len(data)
     elif isinstance(data, dict):
         nums = [v for v in data.values() if isinstance(v, (int, float))]
         answer = sum(nums) if nums else len(data)
-
-    # Case C: pure text → extract numbers
     else:
         nums = [int(n) for n in re.findall(r"\b\d+\b", str(data))]
         answer = sum(nums) if nums else 0
 
-    # Submit URL (from page origin)
-    base = urlparse(url)
-    submit_url = f"{base.scheme}://{base.netloc}/submit"
-
-    payload = {
-        "email": email,
-        "secret": secret,
-        "url": url,
-        "answer": answer,
-    }
+    submit_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}/submit"
+    payload = {"email": email, "secret": secret, "url": url, "answer": answer}
 
     async with httpx.AsyncClient() as client:
-        submit_resp = await client.post(submit_url, json=payload)
+        resp = await client.post(submit_url, json=payload)
 
-    rjson = submit_resp.json()
-
+    rjson = resp.json()
     return {
         "type": "api_quiz",
         "api_url": api_url,
         "headers_used": headers,
         "api_response": data,
         "computed_answer": answer,
-        "submitted_to": submit_url,
         "server_response": rjson,
-        "next_url": rjson.get("url"),
+        "next_url": rjson.get("url")
     }
+
+
+# --------------------------------------------------------------------
+# CSV PARSER WITH HEADER SUPPORT
+# --------------------------------------------------------------------
+def parse_csv_with_headers(csv_text):
+    lines = csv_text.strip().splitlines()
+    try:
+        reader = csv.DictReader(lines)
+        rows = list(reader)
+        if rows and all(rows[0].keys()):
+            return rows
+    except:
+        pass
+
+    result = []
+    for line in lines:
+        try:
+            result.append(int(line))
+        except:
+            try:
+                result.append(float(line))
+            except:
+                result.append(line)
+    return result
+
 
 # --------------------------------------------------------------------
 # UNIVERSAL QUIZ SOLVER
@@ -152,49 +169,33 @@ async def solve_single_quiz(email, secret, url):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
         try:
             await page.goto(url, wait_until="load", timeout=15000)
             await page.wait_for_timeout(800)
 
-            # Sometimes body contains JSON
             try:
                 body_text = await page.inner_text("body")
-                import json
-                parsed = json.loads(body_text)
-                if "url" in parsed and parsed["url"]:
-                    return {
-                        "type": "direct_json",
-                        "server_response": parsed,
-                        "next_url": parsed["url"],
-                    }
+                parsed_json = json.loads(body_text)
+                if "url" in parsed_json:
+                    return {"type": "direct_json", "server_response": parsed_json, "next_url": parsed_json["url"]}
             except:
                 pass
 
             html = await page.content()
-            print("=== RENDERED HTML ===")
-            print(html)
-            # API quiz detection
-            api_get_url = re.search(r'\bGET\s+(https?://[^\s"\'<>]+)', html)
-            
-            if api_get_url:
+
+            if re.search(r'\bGET\s+(https?://[^\s"\'<>]+)', html):
                 return await handle_api_quiz(email, secret, url, html)
 
-
-            # PDF quiz
             pdf_match = re.search(r'href=["\']([^"\']+\.pdf)["\']', html)
             if pdf_match:
                 return await handle_pdf_quiz(email, secret, url, html, pdf_match)
 
-            # Scrape quiz
             if "demo-scrape-data" in html:
                 return await handle_scrape_quiz(email, secret, url, html)
 
-            # Audio quiz
             if "demo-audio-data.csv" in html or ".opus" in html:
                 return await handle_audio_quiz(email, secret, url, html)
 
-            # HTML quiz
             return await handle_html_quiz(email, secret, url, html)
 
         except Exception as e:
@@ -205,176 +206,123 @@ async def solve_single_quiz(email, secret, url):
 
 
 # --------------------------------------------------------------------
-# SCRAPE QUIZ
-# --------------------------------------------------------------------
-async def handle_scrape_quiz(email, secret, url, html):
-    match = re.search(r'href="(/demo-scrape-data[^"]+)"', html)
-    if not match:
-        return {"error": "demo-scrape-data link not found"}
-
-    scrape_url = urljoin(url, match.group(1))
-
-    async with httpx.AsyncClient() as client:
-        r = await client.get(scrape_url)
-        secret_code = r.text.strip()
-
-    base = urlparse(url)
-    submit_url = f"{base.scheme}://{base.netloc}/submit"
-
-    payload = {
-        "email": email,
-        "secret": secret,
-        "url": url,
-        "answer": secret_code,
-    }
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(submit_url, json=payload)
-
-    rjson = resp.json()
-
-    return {
-        "type": "scrape_quiz",
-        "scraped_from": scrape_url,
-        "secret_code": secret_code,
-        "submitted_to": submit_url,
-        "server_response": rjson,
-        "next_url": rjson.get("url"),
-    }
-
-
-# --------------------------------------------------------------------
 # AUDIO QUIZ
 # --------------------------------------------------------------------
 async def handle_audio_quiz(email, secret, url, html):
+
     csv_match = re.search(r'href="([^"]+\.csv)"', html)
     if not csv_match:
         return {"error": "CSV link not found"}
 
     csv_url = urljoin(url, csv_match.group(1))
 
-    cutoff_match = re.search(r'<span id="cutoff">(\d+)</span>', html)
-    if not cutoff_match:
-        return {"error": "Cutoff missing"}
-
-    cutoff = int(cutoff_match.group(1))
+    cutoff = int(re.search(r'<span id="cutoff">(\d+)</span>', html).group(1))
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(csv_url)
-        csv_text = resp.text
+        csv_text = (await client.get(csv_url)).text
 
-    numbers = []
-    for line in csv_text.splitlines():
-        try:
-            numbers.append(int(line.strip()))
-        except:
-            pass
+    parsed = parse_csv_with_headers(csv_text)
+
+    if parsed and isinstance(parsed[0], dict):
+        numeric_cols = []
+        for col in parsed[0]:
+            try:
+                float(parsed[0][col])
+                numeric_cols.append(col)
+            except:
+                pass
+        if numeric_cols:
+            col = numeric_cols[0]
+            numbers = [float(row[col]) for row in parsed]
+        else:
+            numbers = []
+    else:
+        numbers = [x for x in parsed if isinstance(x, (int, float))]
 
     answer = sum(n for n in numbers if n > cutoff)
 
-    base = urlparse(url)
-    submit_url = f"{base.scheme}://{base.netloc}/submit"
-
-    payload = {
-        "email": email,
-        "secret": secret,
-        "url": url,
-        "answer": answer,
-    }
+    submit_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}/submit"
+    payload = {"email": email, "secret": secret, "url": url, "answer": answer}
 
     async with httpx.AsyncClient() as client:
-        submit_resp = await client.post(submit_url, json=payload)
-
-    rjson = submit_resp.json()
+        r = await client.post(submit_url, json=payload)
 
     return {
         "type": "audio_quiz",
-        "csv": csv_url,
-        "cutoff": cutoff,
-        "numbers_count": len(numbers),
         "computed_answer": answer,
-        "submitted_to": submit_url,
-        "server_response": rjson,
-        "next_url": rjson.get("url"),
+        "next_url": r.json().get("url")
     }
+
+
+# --------------------------------------------------------------------
+# SCRAPE QUIZ
+# --------------------------------------------------------------------
+async def handle_scrape_quiz(email, secret, url, html):
+    match = re.search(r'href="(/demo-scrape-data[^"]+)"', html)
+    scrape_url = urljoin(url, match.group(1))
+
+    async with httpx.AsyncClient() as client:
+        secret_code = (await client.get(scrape_url)).text.strip()
+
+    submit_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}/submit"
+    payload = {"email": email, "secret": secret, "url": url, "answer": secret_code}
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(submit_url, json=payload)
+
+    return {"type": "scrape_quiz", "answer": secret_code, "next_url": r.json().get("url")}
 
 
 # --------------------------------------------------------------------
 # HTML QUIZ
 # --------------------------------------------------------------------
 async def handle_html_quiz(email, secret, url, html):
-    pre_match = re.search(r"<pre>(.*?)</pre>", html, flags=re.DOTALL)
-    if pre_match:
-        base = urlparse(url)
-        submit_url = f"{base.scheme}://{base.netloc}/submit"
+    if re.search(r"<pre>(.*?)</pre>", html, re.DOTALL):
+        submit_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}/submit"
+        payload = {"email": email, "secret": secret, "url": url, "answer": "test"}
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                submit_url,
-                json={
-                    "email": email,
-                    "secret": secret,
-                    "url": url,
-                    "answer": "test",
-                },
-            )
+            r = await client.post(submit_url, json=payload)
 
-        rjson = resp.json()
+        return {"type": "html_quiz", "next_url": r.json().get("url")}
 
-        return {
-            "type": "html_quiz",
-            "submitted_to": submit_url,
-            "server_response": rjson,
-            "next_url": rjson.get("url"),
-        }
-
-    return {"error": "No PDF or HTML instructions found"}
+    return {"error": "No quiz instructions found"}
 
 
 # --------------------------------------------------------------------
-# PDF QUIZ
+# PDF QUIZ (FIXED)
 # --------------------------------------------------------------------
 async def handle_pdf_quiz(email, secret, url, html, pdf_match):
+
     pdf_url = urljoin(url, pdf_match.group(1))
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(pdf_url)
-        pdf_data = resp.content
+        pdf_data = (await client.get(pdf_url)).content
 
     reader = PdfReader(BytesIO(pdf_data))
-    text = reader.pages[1].extract_text()
+
+    try:
+        if len(reader.pages) > 1:
+            text = reader.pages[1].extract_text() or ""
+        else:
+            text = reader.pages[0].extract_text() or ""
+
+        if len(text.strip()) < 10:
+            text = extract_text_fallback(reader)
+    except:
+        text = extract_text_fallback(reader)
 
     numbers = [int(n) for n in re.findall(r"\b\d+\b", text)]
     answer = sum(numbers)
 
-    submit_match = re.search(r"https?://[^\"']+/submit", html)
-    if not submit_match:
-        return {"error": "submit URL not found"}
+    submit_url = re.search(r"https?://[^\"']+/submit", html).group(0)
 
-    submit_url = submit_match.group(0)
+    payload = {"email": email, "secret": secret, "url": url, "answer": answer}
 
     async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            submit_url,
-            json={
-                "email": email,
-                "secret": secret,
-                "url": url,
-                "answer": answer,
-            },
-        )
+        r = await client.post(submit_url, json=payload)
 
-    rjson = resp.json()
-
-    return {
-        "type": "pdf_quiz",
-        "pdf": pdf_url,
-        "numbers": numbers,
-        "answer": answer,
-        "submitted_to": submit_url,
-        "server_response": rjson,
-        "next_url": rjson.get("url"),
-    }
+    return {"type": "pdf_quiz", "answer": answer, "next_url": r.json().get("url")}
 
 
 # --------------------------------------------------------------------
@@ -382,6 +330,4 @@ async def handle_pdf_quiz(email, secret, url, html, pdf_match):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("run:app", host="0.0.0.0", port=8000)
-
