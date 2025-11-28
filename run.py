@@ -364,8 +364,11 @@ async def handle_audio_quiz(email, secret, url, html):
     return {
         "type": "audio_quiz",
         "computed_answer": answer,
+        "correct": r.json().get("correct"),
+        "reason": r.json().get("reason"),
         "next_url": r.json().get("url")
     }
+
 
 
 # --------------------------------------------------------------------
@@ -445,4 +448,5 @@ async def handle_pdf_quiz(email, secret, url, html, pdf_match):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("run:app", host="0.0.0.0", port=8000)
+
 
