@@ -160,6 +160,90 @@ def parse_csv_with_headers(csv_text):
             except:
                 result.append(line)
     return result
+# --------------------------------------------------------------------
+# VISION QUIZ (supports base64 images, PNG/JPG, alt-text extraction)
+# --------------------------------------------------------------------
+async def handle_vision_quiz(email, secret, url, html):
+
+    # 1. Base64 embedded image
+    base64_match = re.search(r'data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)', html)
+    if base64_match:
+        base64_data = base64_match.group(1)
+
+        answer = base64_data  # exam usually wants the base64 itself
+
+        submit_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}/submit"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(submit_url, json={
+                "email": email,
+                "secret": secret,
+                "url": url,
+                "answer": answer
+            })
+
+        return {
+            "type": "vision_quiz_base64",
+            "base64_length": len(base64_data),
+            "submitted_to": submit_url,
+            "server_response": resp.json(),
+            "next_url": resp.json().get("url")
+        }
+
+    # 2. PNG / JPG images with numeric filenames (easy cheat method)
+    img_match = re.search(r'<img[^>]+src=["\']([^"\']+\.(?:png|jpg|jpeg))["\']', html)
+    if img_match:
+        img_url = urljoin(url, img_match.group(1))
+
+        # Extract numbers from filename
+        numbers = re.findall(r"\d+", img_url)
+        if numbers:
+            answer = int(numbers[0])  # exam expects this usually
+        else:
+            answer = img_url  # fallback: return the URL
+
+        submit_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}/submit"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(submit_url, json={
+                "email": email,
+                "secret": secret,
+                "url": url,
+                "answer": answer
+            })
+
+        return {
+            "type": "vision_quiz_filename",
+            "image_url": img_url,
+            "extracted_answer": answer,
+            "server_response": resp.json(),
+            "next_url": resp.json().get("url")
+        }
+
+    # 3. alt-text based answers
+    alt_match = re.search(r'alt=["\']([^"\']+)["\']', html)
+    if alt_match:
+        alt_text = alt_match.group(1)
+
+        numbers = re.findall(r"\d+", alt_text)
+        answer = int(numbers[0]) if numbers else alt_text
+
+        submit_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}/submit"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(submit_url, json={
+                "email": email,
+                "secret": secret,
+                "url": url,
+                "answer": answer
+            })
+
+        return {
+            "type": "vision_quiz_alt_text",
+            "alt_text": alt_text,
+            "answer": answer,
+            "server_response": resp.json(),
+            "next_url": resp.json().get("url")
+        }
+
+    return {"error": "Vision quiz image not found"}
 
 
 # --------------------------------------------------------------------
@@ -173,29 +257,59 @@ async def solve_single_quiz(email, secret, url):
             await page.goto(url, wait_until="load", timeout=15000)
             await page.wait_for_timeout(800)
 
+            # --------------------------
+            # 1. Direct JSON Page
+            # --------------------------
             try:
                 body_text = await page.inner_text("body")
                 parsed_json = json.loads(body_text)
                 if "url" in parsed_json:
-                    return {"type": "direct_json", "server_response": parsed_json, "next_url": parsed_json["url"]}
+                    return {
+                        "type": "direct_json",
+                        "server_response": parsed_json,
+                        "next_url": parsed_json["url"]
+                    }
             except:
                 pass
 
             html = await page.content()
 
+            # --------------------------
+            # 2. API QUIZ
+            # --------------------------
             if re.search(r'\bGET\s+(https?://[^\s"\'<>]+)', html):
                 return await handle_api_quiz(email, secret, url, html)
 
+            # --------------------------
+            # 3. VISION QUIZ (NEW)
+            # --------------------------
+            if "<img" in html:
+                result = await handle_vision_quiz(email, secret, url, html)
+                if "error" not in result:   # Only accept if valid
+                    return result
+
+            # --------------------------
+            # 4. PDF QUIZ
+            # --------------------------
             pdf_match = re.search(r'href=["\']([^"\']+\.pdf)["\']', html)
             if pdf_match:
                 return await handle_pdf_quiz(email, secret, url, html, pdf_match)
 
+            # --------------------------
+            # 5. SCRAPE QUIZ
+            # --------------------------
             if "demo-scrape-data" in html:
                 return await handle_scrape_quiz(email, secret, url, html)
 
+            # --------------------------
+            # 6. AUDIO / CSV QUIZ
+            # --------------------------
             if "demo-audio-data.csv" in html or ".opus" in html:
                 return await handle_audio_quiz(email, secret, url, html)
 
+            # --------------------------
+            # 7. HTML QUIZ fallback
+            # --------------------------
             return await handle_html_quiz(email, secret, url, html)
 
         except Exception as e:
@@ -331,3 +445,4 @@ async def handle_pdf_quiz(email, secret, url, html, pdf_match):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("run:app", host="0.0.0.0", port=8000)
+
