@@ -64,6 +64,86 @@ async def solve_quiz_recursive(email, secret, url, start_time, deadline):
 
     return result
 
+# --------------------------------------------------------------------
+# API QUIZ (GET request with headers)
+# --------------------------------------------------------------------
+async def handle_api_quiz(email, secret, url, html):
+    import json
+
+    # Detect API GET URL inside the instructions
+    api_match = re.search(r'GET\s+(https?://[^\s"\'<>]+)', html)
+    if not api_match:
+        return {"error": "API URL not found"}
+
+    api_url = api_match.group(1)
+
+    # Detect HTTP headers in the instructions:
+    # Example:
+    #   Authorization: Bearer 12345
+    #   X-API-Key: abcdef
+    header_matches = re.findall(r'([A-Za-z0-9\-]+)\s*:\s*([^\n<]+)', html)
+
+    headers = {}
+    for key, value in header_matches:
+        headers[key.strip()] = value.strip()
+
+    # Call the API
+    async with httpx.AsyncClient() as client:
+        api_resp = await client.get(api_url, headers=headers)
+
+    # Try parsing JSON, fallback to text
+    try:
+        data = api_resp.json()
+    except:
+        data = api_resp.text
+
+    # -----------------------------------------------------
+    # Now compute the answer depending on the data shape
+    # -----------------------------------------------------
+
+    # Case A: JSON list of objects with "value" keys
+    if isinstance(data, list) and all(isinstance(x, dict) for x in data):
+        if "value" in data[0]:
+            answer = sum(item["value"] for item in data if isinstance(item.get("value"), (int, float)))
+        else:
+            answer = len(data)  # fallback logic
+
+    # Case B: JSON object -> count keys or sum numbers inside
+    elif isinstance(data, dict):
+        nums = [v for v in data.values() if isinstance(v, (int, float))]
+        answer = sum(nums) if nums else len(data)
+
+    # Case C: pure text → extract numbers
+    else:
+        nums = [int(n) for n in re.findall(r"\b\d+\b", str(data))]
+        answer = sum(nums) if nums else 0
+
+    # Submit URL (from page origin)
+    base = urlparse(url)
+    submit_url = f"{base.scheme}://{base.netloc}/submit"
+
+    payload = {
+        "email": email,
+        "secret": secret,
+        "url": url,
+        "answer": answer,
+    }
+
+    async with httpx.AsyncClient() as client:
+        submit_resp = await client.post(submit_url, json=payload)
+
+    rjson = submit_resp.json()
+
+    return {
+        "type": "api_quiz",
+        "api_url": api_url,
+        "headers_used": headers,
+        "api_response": data,
+        "computed_answer": answer,
+        "submitted_to": submit_url,
+        "server_response": rjson,
+        "next_url": rjson.get("url"),
+    }
 
 # --------------------------------------------------------------------
 # UNIVERSAL QUIZ SOLVER
@@ -94,6 +174,12 @@ async def solve_single_quiz(email, secret, url):
             html = await page.content()
             print("=== RENDERED HTML ===")
             print(html)
+            # API quiz detection
+            api_get_url = re.search(r'\bGET\s+(https?://[^\s"\'<>]+)', html)
+            
+            if api_get_url:
+                return await handle_api_quiz(email, secret, url, html)
+
 
             # PDF quiz
             pdf_match = re.search(r'href=["\']([^"\']+\.pdf)["\']', html)
@@ -298,3 +384,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("run:app", host="0.0.0.0", port=8000)
+
